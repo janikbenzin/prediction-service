@@ -10,7 +10,7 @@ use axum::{
 use clap::Parser;
 use moka::future::Cache;
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{builder::GraphOptimizationLevel, Session},
     value::Tensor,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::trace::{self, TraceLayer};
 use tracing::Level;
+
 type Model = Session;
 
 #[derive(Parser)]
@@ -26,14 +27,24 @@ type Model = Session;
 struct Args {
     #[arg(long)]
     enable_logging: bool,
-    #[arg(short, long, default_value_t=3000)]
-    port: u16
+    #[arg(short, long, default_value_t = 3000)]
+    port: u16,
 }
 
 #[derive(Clone)]
 struct AppState {
     // As we can only run a single inference through each model, we need to mutex it
     model_cache: Cache<String, Arc<Mutex<Session>>>,
+    // Cache the mutable, rolling input per model_url (overwritten on init=true)
+    input_cache: Cache<String, Arc<Mutex<CachedInput>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedInput {
+    data: Vec<f32>,
+    sensors: usize,
+    covariates: usize,
+    input_size: usize,
 }
 
 // MAX_CACHED_MODELS needs to be > 0
@@ -71,11 +82,14 @@ async fn main() {
     };
 
     let model_cache: Cache<String, Arc<Mutex<Session>>> = Cache::new(MAX_CACHED_MODELS);
-    let state = AppState { model_cache };
+    let input_cache: Cache<String, Arc<Mutex<CachedInput>>> = Cache::new(MAX_CACHED_MODELS);
+    let state = AppState {
+        model_cache,
+        input_cache,
+    };
 
     // build our application with a route
     let app = Router::new()
-        // `GET /` goes to `root`
         .route("/", post(handle_request))
         .layer(
             service_builder
@@ -85,52 +99,65 @@ async fn main() {
         .with_state(state);
 
     println!("Serving on port {}", config.port);
-    let listener = tokio::net::TcpListener::bind(format!(":::{}", config.port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!(":::{}", config.port))
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PredictionRequest {
-    input: String,
+    /// If true: fetch input from `input_resource` (HTTP GET), cache it, run inference, update cached input.
+    /// If false: `input` contains new covariate values; update cached covariates, run inference, update cached sensors.
+    init: bool,
+
+    /// Flattened array JSON string (Vec<f32>), used only when init=false (new covariate values).
+    /// Example for one covariate: "[1.0]"
+    input: Option<String>,
+
+    /// Shape JSON string, e.g. "[1,3600]"
     shape: String,
+
     model_url: String,
+
+    /// Required when init=true. URL to PHP script returning JSON containing key "sensor_".
+    input_resource: Option<String>,
+
+    /// Number of sensors (output is [1, sensors]).
+    sensors: usize,
+
+    /// Number of covariates appended after all sensor histories.
+    covariates: usize,
+
+    /// Length of each sensor/covariate history window (oldest -> newest).
+    input_size: usize,
 }
 
 #[axum::debug_handler]
-async fn handle_request(
-    State(state): State<AppState>,
-    Form(request): Form<PredictionRequest>,
-) -> Response {
+async fn handle_request(State(state): State<AppState>, Form(request): Form<PredictionRequest>) -> Response {
     let model_url = request.model_url.as_str();
+
+    // 1) Load (and cache) the ONNX model
     let model = state.model_cache.get(model_url).await;
     let local_model = match model {
-        Some(model) => {
-            // Acquire shared pointer to cached model (stays valid even if model is moved out of the cache during the request)
-            model.clone()
-        }
+        Some(model) => model.clone(),
         None => {
-            // Model is not cached, thus download model, and store in cache
             let client = reqwest::Client::new();
             let res = client.get(model_url).send().await;
             let res = match res {
-                Ok(response) => {
-                    match response.error_for_status() {
-                        Ok(res) => match res.bytes().await {
-                            Ok(model_file) => {
-                                construct_model(&model_file, GraphOptimizationLevel::Level3, 1)
-                            }
-                            Err(err) => {
-                                println!("Encountered error retrieving model: {:?}", err);
-                                Err(err.into())
-                            },
-                        },
+                Ok(response) => match response.error_for_status() {
+                    Ok(res) => match res.bytes().await {
+                        Ok(model_file) => construct_model(&model_file, GraphOptimizationLevel::Level3, 1),
                         Err(err) => {
+                            println!("Encountered error retrieving model: {:?}", err);
                             Err(err.into())
                         }
-                    }
-                }
+                    },
+                    Err(err) => Err(err.into()),
+                },
                 Err(err) => Err(err.into()),
             };
+
             match res {
                 Ok(model) => {
                     let model = Arc::new(Mutex::new(model));
@@ -141,43 +168,306 @@ async fn handle_request(
                     model
                 }
                 Err(err) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err))
-                        .into_response();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)).into_response();
                 }
             }
         }
     };
 
-    let shape: Vec<usize> = serde_json::from_str(&request.shape).unwrap();
-    let input: Vec<f32> = serde_json::from_str(&request.input).unwrap();
-    let input = match Tensor::from_array((shape, input)) {
+    // 2) Validate shape vs requested dimensions
+    let shape: Vec<usize> = match serde_json::from_str(&request.shape) {
+        Ok(s) => s,
+        Err(err) => return (StatusCode::BAD_REQUEST, format!("Invalid shape JSON: {:?}", err)).into_response(),
+    };
+    let shape_elems: usize = shape.iter().product();
+
+    let expected_total = (request.sensors + request.covariates) * request.input_size;
+    if shape_elems != expected_total {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Shape element count ({}) does not match expected (sensors+covariates)*input_size = ({:+})*{} = {}",
+                shape_elems,
+                request.sensors + request.covariates,
+                request.input_size,
+                expected_total
+            ),
+        )
+            .into_response();
+    }
+
+    // 3) Acquire or (re)initialize cached input
+    if request.init {
+        let input_resource = match request.input_resource.as_deref() {
+            Some(u) if !u.is_empty() => u,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "init=true requires input_resource".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        // Fetch JSON via HTTP GET
+        let client = reqwest::Client::new();
+        let res = match client.get(input_resource).send().await {
+            Ok(r) => match r.error_for_status() {
+                Ok(ok) => ok,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("input_resource returned error status: {:?}", err),
+                    )
+                        .into_response();
+                }
+            },
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to GET input_resource: {:?}", err),
+                )
+                    .into_response();
+            }
+        };
+
+        let json: serde_json::Value = match res.json().await {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to parse JSON from input_resource: {:?}", err),
+                )
+                    .into_response();
+            }
+        };
+
+        // Expect: { "sensor_": [[...]] , ... }
+        let sensor_val = match json.get("sensor_") {
+            Some(v) => v,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    r#"input_resource JSON missing key "sensor_""#.to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut flattened: Vec<f32> = Vec::with_capacity(expected_total);
+        match sensor_val {
+            serde_json::Value::Array(rows) => {
+                for row in rows {
+                    match row {
+                        serde_json::Value::Array(cols) => {
+                            for col in cols {
+                                match col.as_f64() {
+                                    Some(x) => flattened.push(x as f32),
+                                    None => {
+                                        return (
+                                            StatusCode::BAD_REQUEST,
+                                            "sensor_ contains non-numeric value".to_string(),
+                                        )
+                                            .into_response();
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                "sensor_ must be an array of arrays".to_string(),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "sensor_ must be an array".to_string(),
+                )
+                    .into_response();
+            }
+        }
+
+        if flattened.len() != expected_total {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    r#"Flattened sensor_ length ({}) does not match expected_total ({})"#,
+                    flattened.len(),
+                    expected_total
+                ),
+            )
+                .into_response();
+        }
+
+        let cached = CachedInput {
+            data: flattened,
+            sensors: request.sensors,
+            covariates: request.covariates,
+            input_size: request.input_size,
+        };
+
+        state
+            .input_cache
+            .insert(model_url.to_owned(), Arc::new(Mutex::new(cached)))
+            .await;
+    } else {
+        // init=false requires existing cache
+        if state.input_cache.get(model_url).await.is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "init=false received but no cached input exists; call init=true first".to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    // 4) Update covariates if init=false (then we always run inference)
+    if !request.init {
+        let cov_values_json = match request.input.as_deref() {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "init=false requires input (new covariate values)".to_string(),
+                )
+                    .into_response();
+            }
+        };
+
+        let cov_values: Vec<f32> = match serde_json::from_str(cov_values_json) {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid input JSON for covariates: {:?}", err),
+                )
+                    .into_response();
+            }
+        };
+
+        if cov_values.len() != request.covariates {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Expected {} covariate values, got {}",
+                    request.covariates,
+                    cov_values.len()
+                ),
+            )
+                .into_response();
+        }
+
+        let cached_arc = state.input_cache.get(model_url).await.unwrap();
+        let mut cached = cached_arc.lock().await;
+
+        // If a new init=true happened with different params, reject mismatched updates
+        if cached.sensors != request.sensors
+            || cached.covariates != request.covariates
+            || cached.input_size != request.input_size
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Cached input dimensions do not match request; call init=true again".to_string(),
+            )
+                .into_response();
+        }
+
+        // Cached layout:
+        // [ sensors * input_size ][ covariates * input_size ]
+        let cov_base = cached.sensors * cached.input_size;
+
+        for c in 0..cached.covariates {
+            let start = cov_base + c * cached.input_size;
+            let end = start + cached.input_size;
+            shift_append(&mut cached.data[start..end], cov_values[c]);
+        }
+    }
+
+    // 5) Run inference on current cached input
+    let cached_arc = match state.input_cache.get(model_url).await {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error: cached input missing after init handling".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let mut cached = cached_arc.lock().await;
+    let input_tensor = match Tensor::from_array((shape, cached.data.clone())) {
         Ok(input) => input,
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
+
     let mut model_lock = local_model.lock().await;
-    let res = match model_lock.run(ort::inputs![input]) {
+    let out = match model_lock.run(ort::inputs![input_tensor]) {
         Ok(out) => out,
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
-    let res = match res["variable"].try_extract_array::<f32>() {
-        Ok(input) => input[[0, 0]],
+
+    // Expect output vector shape [1, sensors]
+    let pred_arr = match out["variable"].try_extract_array::<f32>() {
+        Ok(a) => a,
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
-    return (StatusCode::OK, res.to_string()).into_response();
+
+    let preds: Vec<f32> = pred_arr.iter().copied().collect();
+    if preds.len() != cached.sensors {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model output length ({}) does not match sensors ({})",
+                preds.len(),
+                cached.sensors
+            ),
+        )
+            .into_response();
+    }
+
+    // 6) Update sensor histories with predicted values (shift + append)
+    for s in 0..cached.sensors {
+        let start = s * cached.input_size;
+        let end = start + cached.input_size;
+        shift_append(&mut cached.data[start..end], preds[s]);
+    }
+
+    // Return predictions (as JSON array string)
+    let body = match serde_json::to_string(&preds) {
+        Ok(s) => s,
+        Err(err) => format!("{:?}", err),
+    };
+    (StatusCode::OK, body).into_response()
 }
 
-fn construct_model(
-    model_bytes: &[u8],
-    level: GraphOptimizationLevel,
-    threads: usize,
-) -> anyhow::Result<Model> {
-    // let mut reader = model_file.reader();
+fn shift_append(slice: &mut [f32], new_val: f32) {
+    if slice.is_empty() {
+        return;
+    }
+    // shift left by 1 (drop oldest)
+    for i in 0..(slice.len() - 1) {
+        slice[i] = slice[i + 1];
+    }
+    // append newest
+    let last = slice.len() - 1;
+    slice[last] = new_val;
+}
+
+fn construct_model(model_bytes: &[u8], level: GraphOptimizationLevel, threads: usize) -> anyhow::Result<Model> {
     let model = Session::builder()?
         .with_optimization_level(level)?
         .with_intra_threads(threads)?
         .commit_from_memory(model_bytes)?;
     Ok(model)
 }
+
+// ... existing code ...
 
 #[cfg(test)]
 mod test {
@@ -190,7 +480,6 @@ mod test {
     #[test]
     fn test_model_creation_d() {
         let model_file_name = "random_forest_heating_2h_short-term.onnx";
-        //File::open(path)
         let level = GraphOptimizationLevel::Disable;
         let model_file = read(format!("./resources/test_files/{}", model_file_name)).unwrap();
         let start = Instant::now();
@@ -207,7 +496,6 @@ mod test {
     #[test]
     fn test_model_creation_l1() {
         let model_file_name = "random_forest_heating_2h_short-term.onnx";
-        //File::open(path)
         let level = GraphOptimizationLevel::Level1;
         let model_file = read(format!("./resources/test_files/{}", model_file_name)).unwrap();
         let start = Instant::now();
@@ -224,7 +512,6 @@ mod test {
     #[test]
     fn test_model_creation_l2() {
         let model_file_name = "random_forest_heating_2h_short-term.onnx";
-        //File::open(path)
         let level = GraphOptimizationLevel::Level2;
         let model_file = read(format!("./resources/test_files/{}", model_file_name)).unwrap();
         let start = Instant::now();
@@ -241,7 +528,6 @@ mod test {
     #[test]
     fn test_model_creation_l3() {
         let model_file_name = "random_forest_heating_2h_short-term.onnx";
-        //File::open(path)
         let level = GraphOptimizationLevel::Level3;
         let model_file = read(format!("./resources/test_files/{}", model_file_name)).unwrap();
         let start = Instant::now();
