@@ -48,7 +48,7 @@ struct CachedInput {
 }
 
 // MAX_CACHED_MODELS needs to be > 0
-static MAX_CACHED_MODELS: u64 = 4;
+static MAX_CACHED_MODELS: u64 = 8;
 
 #[tokio::main]
 async fn main() {
