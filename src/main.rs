@@ -411,15 +411,26 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         Ok(out) => out,
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
-    println!("{:?}", out);
 
-    // Expect output vector shape [1, sensors]
-    let res = match out.get("variable") {
-        Some(a) => a,
-        None => {
-            match out.get("values") {
-                Some(a) => a,
-                None => return (StatusCode::BAD_REQUEST, format!("Output is neither stored under variable or values???")).into_response()
+    // Try common output names first, then fall back to first output
+    let res = if let Some(a) = out.get("variable") {
+        a
+    } else if let Some(a) = out.get("values") {
+        a
+    } else if let Some(a) = out.get("output") {
+        a
+    } else {
+        // If none of the common names work, just use the first output
+        &match out.iter().next() {
+            Some((name, value)) => {
+                println!("Using first output with name: {}", name);
+                value
+            }
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Model produced no outputs".to_string()
+                ).into_response()
             }
         }
     };
