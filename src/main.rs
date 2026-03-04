@@ -401,7 +401,49 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     };
 
     let mut cached = cached_arc.lock().await;
-    let input_tensor = match Tensor::from_array((shape, cached.data.clone())) {
+
+    // The cache is stored "flat by block":
+    // [ sensors * input_size ][ covariates * input_size ]
+    //
+    // Some models expect an interleaved last-dimension layout, e.g. shape:
+    //   [1, input_size, sensors+covariates]
+    // representing:
+    //   input[0][t] = [s0_t, s1_t, ..., sN_t, c0_t, c1_t, ..., cM_t]
+    //
+    // If the request shape is exactly [1, expected_total], we keep the flat-by-block data.
+    // If the request shape is [1, input_size, sensors+covariates], we build interleaved-by-time data.
+    let input_data: Vec<f32> = if shape.as_slice() == [1usize, expected_total] {
+        cached.data.clone()
+    } else if shape.len() == 3
+        && shape[0] == 1
+        && shape[1] == cached.input_size
+        && shape[2] == (cached.sensors + cached.covariates)
+    {
+        let sensors_base = 0usize;
+        let cov_base = cached.sensors * cached.input_size;
+
+        let mut interleaved = Vec::with_capacity(expected_total);
+
+        for t in 0..cached.input_size {
+            // sensors first
+            for s in 0..cached.sensors {
+                let idx = sensors_base + s * cached.input_size + t;
+                interleaved.push(cached.data[idx]);
+            }
+            // then covariates (your "modes", e.g. 17)
+            for c in 0..cached.covariates {
+                let idx = cov_base + c * cached.input_size + t;
+                interleaved.push(cached.data[idx]);
+            }
+        }
+
+        interleaved
+    } else {
+        // Keep existing behavior for other shapes (Tensor::from_array will validate element count)
+        cached.data.clone()
+    };
+
+    let input_tensor = match Tensor::from_array((shape, input_data)) {
         Ok(input) => input,
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
@@ -453,15 +495,15 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
             .into_response();
     }
 
-    // 6) Update sensor histories with predicted values (shift + append)
-    for s in 0..cached.sensors {
-        let start = s * cached.input_size;
-        let end = start + cached.input_size;
-        shift_append(&mut cached.data[start..end], preds[s]);
-    }
+    // Return predictions
+    // By default, serializing f32 often prints fewer digits than you might expect.
+    // If you want stable, higher-precision textual output, format explicitly.
+    let preds_formatted: Vec<String> = preds
+        .iter()
+        .map(|v| format!("{:.16}", v))
+        .collect();
 
-    // Return predictions (as JSON array string)
-    let body = match serde_json::to_string(&preds) {
+    let body = match serde_json::to_string(&preds_formatted) {
         Ok(s) => s,
         Err(err) => format!("{:?}", err),
     };
