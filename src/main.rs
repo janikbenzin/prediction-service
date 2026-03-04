@@ -495,9 +495,14 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
             .into_response();
     }
 
+    // 6) Update sensor histories with predicted values (shift + append)
+    for s in 0..cached.sensors {
+        let start = s * cached.input_size;
+        let end = start + cached.input_size;
+        shift_append(&mut cached.data[start..end], preds[s]);
+    }
+
     // Return predictions
-    // By default, serializing f32 often prints fewer digits than you might expect.
-    // If you want stable, higher-precision textual output, format explicitly.
     let preds_formatted: Vec<String> = preds
         .iter()
         .map(|v| format!("{:.16}", v))
