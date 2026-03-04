@@ -416,7 +416,11 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     // Expect output vector shape [1, sensors]
     let pred_arr = match out["variable"].try_extract_array::<f32>() {
         Ok(a) => a,
-        Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
+        Err(err) =>
+            match out["values"].try_extract_array::<f32>() {
+                Ok(a) => a,
+                Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response()
+            }
     };
 
     let preds: Vec<f32> = pred_arr.iter().copied().collect();
