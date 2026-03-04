@@ -11,13 +11,16 @@ use clap::Parser;
 use moka::future::Cache;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
-    value::Tensor,
+    value::{Tensor, ValueType},
+    tensor::TensorElementType,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::trace::{self, TraceLayer};
 use tracing::Level;
+
+
 
 type Model = Session;
 
@@ -115,9 +118,6 @@ struct PredictionRequest {
     /// Example for one covariate: "[1.0]"
     input: Option<String>,
 
-    /// Shape JSON string, e.g. "[1,3600]"
-    shape: String,
-
     model_url: String,
 
     /// Required when init=true. URL to PHP script returning JSON containing key "sensor_".
@@ -174,10 +174,31 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         }
     };
 
-    // 2) Validate shape vs requested dimensions
-    let shape: Vec<usize> = match serde_json::from_str(&request.shape) {
-        Ok(s) => s,
-        Err(err) => return (StatusCode::BAD_REQUEST, format!("Invalid shape JSON: {:?}", err)).into_response(),
+    // 2) Derive input shape from the ONNX model metadata
+    let shape: Vec<usize> = {
+        let model_lock = local_model.lock().await;
+        let input_info = match model_lock.inputs.first() {
+            Some(i) => i,
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, "Model has no inputs".to_string()).into_response(),
+        };
+        match &input_info.input_type {
+            ValueType::Tensor { ty: TensorElementType::Float32, shape: tensor_shape, .. } => {
+                tensor_shape.iter().map(|&d| {
+                    if d < 0 {
+                        // Dynamic dimension — treat as 1 (batch)
+                        1usize
+                    } else {
+                        d as usize
+                    }
+                }).collect()
+            }
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Unexpected model input type: {:?}", other),
+                ).into_response();
+            }
+        }
     };
     let shape_elems: usize = shape.iter().product();
 
@@ -186,9 +207,10 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         return (
             StatusCode::BAD_REQUEST,
             format!(
-                "Shape element count ({}) does not match expected (sensors+covariates)*input_size = ({:+})*{} = {}",
+                "Model input element count ({}) does not match expected (sensors+covariates)*input_size = ({}+{})*{} = {}",
                 shape_elems,
-                request.sensors + request.covariates,
+                request.sensors,
+                request.covariates,
                 request.input_size,
                 expected_total
             ),
