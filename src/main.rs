@@ -524,13 +524,7 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         shift_append(&mut cached.data[start..end], preds[s]);
     }
 
-    // Return predictions
-    let preds_formatted: Vec<String> = preds
-        .iter()
-        .map(|v| format!("{:.16}", v))
-        .collect();
-
-    let body = match serde_json::to_string(&preds_formatted) {
+    let body = match serde_json::to_string(&preds) {
         Ok(s) => s,
         Err(err) => format!("{:?}", err),
     };
