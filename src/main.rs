@@ -35,12 +35,17 @@ struct Args {
 }
 
 #[derive(Clone)]
-struct AppState {
-    // As we can only run a single inference through each model, we need to mutex it
-    model_cache: Cache<String, Arc<Mutex<Session>>>,
-    // Cache the mutable, rolling input per model_url (overwritten on init=true)
-    input_cache: Cache<String, Arc<Mutex<CachedInput>>>,
+struct CachedModelData {
+    model: Arc<Mutex<Session>>,
+    input: Arc<Mutex<CachedInput>>,
 }
+
+#[derive(Clone)]
+struct AppState {
+    // Single unified cache ensures model and input are always evicted together
+    cache: Cache<String, Arc<CachedModelData>>,
+}
+
 
 #[derive(Debug, Clone)]
 struct CachedInput {
@@ -84,12 +89,8 @@ async fn main() {
         None
     };
 
-    let model_cache: Cache<String, Arc<Mutex<Session>>> = Cache::new(MAX_CACHED_MODELS);
-    let input_cache: Cache<String, Arc<Mutex<CachedInput>>> = Cache::new(MAX_CACHED_MODELS);
-    let state = AppState {
-        model_cache,
-        input_cache,
-    };
+    let cache: Cache<String, Arc<CachedModelData>> = Cache::new(MAX_CACHED_MODELS);
+    let state = AppState { cache };
 
     // build our application with a route
     let app = Router::new()
@@ -137,11 +138,13 @@ struct PredictionRequest {
 async fn handle_request(State(state): State<AppState>, Form(request): Form<PredictionRequest>) -> Response {
     let model_url = request.model_url.as_str();
 
-    // 1) Load (and cache) the ONNX model
-    let model = state.model_cache.get(model_url).await;
-    let local_model = match model {
-        Some(model) => model.clone(),
+    // 1) Get or create the cached model data
+    let cached_data = state.cache.get(model_url).await;
+
+    let cached_data = match cached_data {
+        Some(data) => data,
         None => {
+            // Load the model
             let client = reqwest::Client::new();
             let res = client.get(model_url).send().await;
             let res = match res {
@@ -160,12 +163,19 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
 
             match res {
                 Ok(model) => {
-                    let model = Arc::new(Mutex::new(model));
-                    state
-                        .model_cache
-                        .insert(model_url.to_owned(), model.clone())
-                        .await;
-                    model
+                    // Create a placeholder input (will be initialized on first init=true call)
+                    let data = Arc::new(CachedModelData {
+                        model: Arc::new(Mutex::new(model)),
+                        input: Arc::new(Mutex::new(CachedInput {
+                            data: Vec::new(),
+                            sensors: 0,
+                            covariates: 0,
+                            input_size: 0,
+                        })),
+                    });
+
+                    state.cache.insert(model_url.to_owned(), data.clone()).await;
+                    data
                 }
                 Err(err) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", err)).into_response();
@@ -173,6 +183,8 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
             }
         }
     };
+
+    let local_model = cached_data.model.clone();
 
     // 2) Derive input shape from the ONNX model metadata
     let shape: Vec<usize> = {
@@ -185,7 +197,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
             ValueType::Tensor { ty: TensorElementType::Float32, shape: tensor_shape, .. } => {
                 tensor_shape.iter().map(|&d| {
                     if d < 0 {
-                        // Dynamic dimension — treat as 1 (batch)
                         1usize
                     } else {
                         d as usize
@@ -264,7 +275,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
             }
         };
 
-        // Expect: { "sensor_": [[...]] , ... }
         let sensor_val = match json.get("sensor_") {
             Some(v) => v,
             None => {
@@ -326,20 +336,18 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
                 .into_response();
         }
 
-        let cached = CachedInput {
+        // Update the cached input
+        let mut input_lock = cached_data.input.lock().await;
+        *input_lock = CachedInput {
             data: flattened,
             sensors: request.sensors,
             covariates: request.covariates,
             input_size: request.input_size,
         };
-
-        state
-            .input_cache
-            .insert(model_url.to_owned(), Arc::new(Mutex::new(cached)))
-            .await;
     } else {
-        // init=false requires existing cache
-        if state.input_cache.get(model_url).await.is_none() {
+        // init=false requires existing initialized cache
+        let input_lock = cached_data.input.lock().await;
+        if input_lock.data.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
                 "init=false received but no cached input exists; call init=true first".to_string(),
@@ -384,10 +392,8 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
                 .into_response();
         }
 
-        let cached_arc = state.input_cache.get(model_url).await.unwrap();
-        let mut cached = cached_arc.lock().await;
+        let mut cached = cached_data.input.lock().await;
 
-        // If a new init=true happened with different params, reject mismatched updates
         if cached.sensors != request.sensors
             || cached.covariates != request.covariates
             || cached.input_size != request.input_size
@@ -399,8 +405,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
                 .into_response();
         }
 
-        // Cached layout:
-        // [ sensors * input_size ][ covariates * input_size ]
         let cov_base = cached.sensors * cached.input_size;
 
         for c in 0..cached.covariates {
@@ -411,29 +415,8 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     }
 
     // 5) Run inference on current cached input
-    let cached_arc = match state.input_cache.get(model_url).await {
-        Some(v) => v,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error: cached input missing after init handling".to_string(),
-            )
-                .into_response();
-        }
-    };
+    let mut cached = cached_data.input.lock().await;
 
-    let mut cached = cached_arc.lock().await;
-
-    // The cache is stored "flat by block":
-    // [ sensors * input_size ][ covariates * input_size ]
-    //
-    // Some models expect an interleaved last-dimension layout, e.g. shape:
-    //   [1, input_size, sensors+covariates]
-    // representing:
-    //   input[0][t] = [s0_t, s1_t, ..., sN_t, c0_t, c1_t, ..., cM_t]
-    //
-    // If the request shape is exactly [1, expected_total], we keep the flat-by-block data.
-    // If the request shape is [1, input_size, sensors+covariates], we build interleaved-by-time data.
     let input_data: Vec<f32> = if shape.as_slice() == [1usize, expected_total] {
         cached.data.clone()
     } else if shape.len() == 3
@@ -447,12 +430,10 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         let mut interleaved = Vec::with_capacity(expected_total);
 
         for t in 0..cached.input_size {
-            // sensors first
             for s in 0..cached.sensors {
                 let idx = sensors_base + s * cached.input_size + t;
                 interleaved.push(cached.data[idx]);
             }
-            // then covariates (your "modes", e.g. 17)
             for c in 0..cached.covariates {
                 let idx = cov_base + c * cached.input_size + t;
                 interleaved.push(cached.data[idx]);
@@ -461,7 +442,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
 
         interleaved
     } else {
-        // Keep existing behavior for other shapes (Tensor::from_array will validate element count)
         cached.data.clone()
     };
 
@@ -476,7 +456,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
         Err(err) => return (StatusCode::BAD_REQUEST, format!("{:?}", err)).into_response(),
     };
 
-    // Try common output names first, then fall back to first output
     let res = if let Some(a) = out.get("variable") {
         a
     } else if let Some(a) = out.get("values") {
@@ -484,7 +463,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     } else if let Some(a) = out.get("output") {
         a
     } else {
-        // If none of the common names work, just use the first output
         &match out.iter().next() {
             Some((name, value)) => {
                 println!("Using first output with name: {}", name);
@@ -530,7 +508,6 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     };
     (StatusCode::OK, body).into_response()
 }
-
 fn shift_append(slice: &mut [f32], new_val: f32) {
     if slice.is_empty() {
         return;
