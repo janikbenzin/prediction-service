@@ -505,26 +505,42 @@ async fn handle_request(State(state): State<AppState>, Form(request): Form<Predi
     };
 
     let preds: Vec<f32> = pred_arr.iter().copied().collect();
-    if preds.len() != cached.sensors {
+    // Determine output format and extract forecast values
+    let forecast: Vec<f32> = if preds.len() == cached.sensors {
+        // Case 1: Output shape is [n_sensors] - direct prediction (backwards compatible)
+        preds
+    } else if preds.len() == cached.input_size * cached.sensors {
+        // Case 2: Output shape is (1, input_size, n_sensors, 1) or (input_size, n_sensors)
+        // Extract prediction[0, -1, :, 0] (last timestep for all sensors)
+        let last_timestep_idx = cached.input_size - 1;
+        (0..cached.sensors)
+            .map(|s| {
+                let idx = last_timestep_idx * cached.sensors + s;
+                preds[idx]
+            })
+            .collect()
+    } else {
         return (
             StatusCode::BAD_REQUEST,
             format!(
-                "Model output length ({}) does not match sensors ({})",
+                "Model output length ({}) does not match expected formats: [{}] or [{} * {}]",
                 preds.len(),
+                cached.sensors,
+                cached.input_size,
                 cached.sensors
             ),
         )
             .into_response();
-    }
+    };
 
     // 6) Update sensor histories with predicted values (shift + append)
     for s in 0..cached.sensors {
         let start = s * cached.input_size;
         let end = start + cached.input_size;
-        shift_append(&mut cached.data[start..end], preds[s]);
+        shift_append(&mut cached.data[start..end], forecast[s]);
     }
 
-    let body = match serde_json::to_string(&preds) {
+    let body = match serde_json::to_string(&forecast) {
         Ok(s) => s,
         Err(err) => format!("{:?}", err),
     };
