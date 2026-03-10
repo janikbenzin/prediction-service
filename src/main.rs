@@ -571,15 +571,25 @@ fn shift_append(slice: &mut [f32], new_val: f32) {
 }
 
 fn construct_model(model_bytes: &[u8], level: GraphOptimizationLevel, threads: usize) -> anyhow::Result<Model> {
+    // Try to create session with detailed logging
+    let cuda_provider = CUDAExecutionProvider::default()
+        .with_device_id(0)  // Explicitly set GPU device
+        .build();
+
+    let rocm_provider = ROCmExecutionProvider::default().build();
+    let cpu_provider = CPUExecutionProvider::default().build();
+
+    println!("Attempting to create session with CUDA provider...");
+
     let model = Session::builder()?
-        .with_execution_providers([
-            CUDAExecutionProvider::default().build(),   // NVIDIA GPU
-            ROCmExecutionProvider::default().build(),   // AMD GPU
-            CPUExecutionProvider::default().build(),    // Fallback
-        ])?
+        .with_execution_providers([cuda_provider, rocm_provider, cpu_provider])?
         .with_optimization_level(level)?
         .with_intra_threads(threads)?
         .commit_from_memory(model_bytes)?;
+
+    // Log which provider is actually being used
+    println!("Session created successfully");
+
     Ok(model)
 }
 // ... existing code ...
