@@ -571,24 +571,33 @@ fn shift_append(slice: &mut [f32], new_val: f32) {
 }
 
 fn construct_model(model_bytes: &[u8], level: GraphOptimizationLevel, threads: usize) -> anyhow::Result<Model> {
-    // Try to create session with detailed logging
-    let cuda_provider = CUDAExecutionProvider::default()
-        .with_device_id(0)  // Explicitly set GPU device
-        .build();
+    let mut session_builder = Session::builder()?;
 
-    let rocm_provider = ROCmExecutionProvider::default().build();
-    let cpu_provider = CPUExecutionProvider::default().build();
+    let mut providers = Vec::new();
 
-    println!("Attempting to create session with CUDA provider...");
+    // Check if CUDA is available before building the provider
+    let cuda = CUDAExecutionProvider::default();
+    if cuda.is_available()? {
+        println!("CUDA Execution Provider is available and will be used.");
+        providers.push(cuda.build());
+    } else {
+        println!("WARNING: CUDA Execution Provider is NOT available.");
+    }
 
-    let model = Session::builder()?
-        .with_execution_providers([cuda_provider, rocm_provider, cpu_provider])?
+    // Check if ROCm is available
+    let rocm = ROCmExecutionProvider::default();
+    if rocm.is_available()? {
+        providers.push(rocm.build());
+    }
+
+    // Always add CPU as fallback
+    providers.push(CPUExecutionProvider::default().build());
+
+    let model = session_builder
+        .with_execution_providers(providers)?
         .with_optimization_level(level)?
         .with_intra_threads(threads)?
         .commit_from_memory(model_bytes)?;
-
-    // Log which provider is actually being used
-    println!("Session created successfully");
 
     Ok(model)
 }
