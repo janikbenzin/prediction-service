@@ -10,10 +10,14 @@ use axum::{
 use clap::Parser;
 use moka::future::Cache;
 use ort::{
+    execution_providers::{CUDAExecutionProvider, ROCmExecutionProvider, CPUExecutionProvider, ExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
+
     value::{Tensor, ValueType},
     tensor::TensorElementType,
+
 };
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
@@ -57,6 +61,7 @@ static MAX_CACHED_MODELS: u64 = 8;
 async fn main() {
     // Consider configuration file if possible
     // In any case: Command line settings overwrite config file settings
+    log_available_providers();
     let config = Args::parse();
     let service_builder = ServiceBuilder::new();
     let trace_layer = if config.enable_logging {
@@ -131,6 +136,11 @@ struct PredictionRequest {
 
     /// Length of each sensor/covariate history window (oldest -> newest).
     input_size: usize,
+}
+
+fn log_available_providers() {
+    println!("CUDA available: {}", CUDAExecutionProvider::default().is_available().unwrap_or(false));
+    println!("ROCm available: {}", ROCmExecutionProvider::default().is_available().unwrap_or(false));
 }
 
 #[axum::debug_handler]
@@ -562,12 +572,16 @@ fn shift_append(slice: &mut [f32], new_val: f32) {
 
 fn construct_model(model_bytes: &[u8], level: GraphOptimizationLevel, threads: usize) -> anyhow::Result<Model> {
     let model = Session::builder()?
+        .with_execution_providers([
+            CUDAExecutionProvider::default().build(),   // NVIDIA GPU
+            ROCmExecutionProvider::default().build(),   // AMD GPU
+            CPUExecutionProvider::default().build(),    // Fallback
+        ])?
         .with_optimization_level(level)?
         .with_intra_threads(threads)?
         .commit_from_memory(model_bytes)?;
     Ok(model)
 }
-
 // ... existing code ...
 
 #[cfg(test)]
