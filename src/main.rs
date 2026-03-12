@@ -10,6 +10,7 @@ use axum::{
 use clap::Parser;
 use moka::future::Cache;
 use ort::{
+    environment::Environment,
     execution_providers::{CUDAExecutionProvider, ROCmExecutionProvider, CPUExecutionProvider, ExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
 
@@ -23,7 +24,7 @@ use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::trace::{self, TraceLayer};
 use tracing::Level;
-
+use anyhow::Result;
 
 
 type Model = Session;
@@ -57,25 +58,48 @@ struct CachedInput {
 // MAX_CACHED_MODELS needs to be > 0
 static MAX_CACHED_MODELS: u64 = 8;
 
+fn compute_providers() -> Result<Vec<ort::execution_providers::ExecutionProviderDispatch>> {
+    let mut providers = Vec::new();
+
+    // Check if CUDA is available before building the provider
+    let cuda = CUDAExecutionProvider::default();
+    if cuda.is_available()? {
+        println!("CUDA Execution Provider is available and will be used.");
+        providers.push(cuda.with_device_id(0).build().error_on_failure());
+    } else {
+        println!("WARNING: CUDA Execution Provider is NOT available.");
+    }
+
+    // Check if ROCm is available
+    let rocm = ROCmExecutionProvider::default();
+    if rocm.is_available()? {
+        providers.push(rocm.build().error_on_failure());
+    }
+
+    // Always add CPU as fallback
+    providers.push(CPUExecutionProvider::default().build().error_on_failure());
+    Ok(providers)
+}
+
 #[tokio::main]
 async fn main() {
     // Consider configuration file if possible
     // In any case: Command line settings overwrite config file settings
-    log_available_providers();
     let config = Args::parse();
     let service_builder = ServiceBuilder::new();
+    // initialize tracing
+    
+    let filter = tracing_subscriber::EnvFilter::new("INFO")
+        // For ort crate only log errors
+        .add_directive("ort=error".parse().unwrap());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .with_line_number(true)
+        .init();
+    
     let trace_layer = if config.enable_logging {
-        let filter = tracing_subscriber::EnvFilter::new("INFO")
-            // For ort crate only log errors
-            .add_directive("ort=error".parse().unwrap());
-        // initialize tracing
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .compact()
-            .with_line_number(true)
-            .init();
-
         Some((
             // Map response body is required as trace layer changes response body if used within an optional layer
             // https://github.com/tokio-rs/axum/discussions/3439
@@ -87,6 +111,22 @@ async fn main() {
         ))
     } else {
         None
+    };
+
+    let providers = match compute_providers() {
+        Ok(x) => {x},
+        Err(err) => {
+            panic!("Failed building providers: {:?}", err)
+        },
+    };
+
+    match ort::init().with_execution_providers(providers).commit() {
+        Ok(x) => {
+            println!("Setting env: {x}")
+        },
+        Err(err) => {
+            panic!("Failed setting environment: {:?}", err)
+        },
     };
 
     let model_cache: Cache<String, Arc<Mutex<Session>>> = Cache::new(MAX_CACHED_MODELS);
@@ -137,12 +177,6 @@ struct PredictionRequest {
     /// Length of each sensor/covariate history window (oldest -> newest).
     input_size: usize,
 }
-
-fn log_available_providers() {
-    println!("CUDA available: {}", CUDAExecutionProvider::default().is_available().unwrap_or(false));
-    println!("ROCm available: {}", ROCmExecutionProvider::default().is_available().unwrap_or(false));
-}
-
 #[axum::debug_handler]
 async fn handle_request(State(state): State<AppState>, Form(request): Form<PredictionRequest>) -> Response {
     let model_url = request.model_url.as_str();
@@ -572,29 +606,7 @@ fn shift_append(slice: &mut [f32], new_val: f32) {
 
 fn construct_model(model_bytes: &[u8], level: GraphOptimizationLevel, threads: usize) -> anyhow::Result<Model> {
     let mut session_builder = Session::builder()?;
-
-    let mut providers = Vec::new();
-
-    // Check if CUDA is available before building the provider
-    let cuda = CUDAExecutionProvider::default();
-    if cuda.is_available()? {
-        println!("CUDA Execution Provider is available and will be used.");
-        providers.push(cuda.build());
-    } else {
-        println!("WARNING: CUDA Execution Provider is NOT available.");
-    }
-
-    // Check if ROCm is available
-    let rocm = ROCmExecutionProvider::default();
-    if rocm.is_available()? {
-        providers.push(rocm.build());
-    }
-
-    // Always add CPU as fallback
-    providers.push(CPUExecutionProvider::default().build());
-
     let model = session_builder
-        .with_execution_providers(providers)?
         .with_optimization_level(level)?
         .with_intra_threads(threads)?
         .commit_from_memory(model_bytes)?;
